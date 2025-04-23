@@ -33,7 +33,7 @@ register(MulticoreParam(workers = 8, progressbar = TRUE))
 ```
 
 
-##Single cell sequencing data visualization
+## Single cell sequencing data visualization
 ### Uniform Manifold Approximation and Projection (UMAP)
 ```{r}
 p <- CellDimPlot(sce,
@@ -246,7 +246,7 @@ wrap_plots(plot_list, ncol = 2, nrow = 2, byrow = TRUE)
 ```
 
 
-##Single-cell copy-number variation
+## Single-cell copy-number variation
 ```{r}
 sce=sce[,sce$celltype%in%c('OB','CB','T cell')]
 sce$celltype_new=ifelse(sce$celltype%in%c('OB'),'OB',
