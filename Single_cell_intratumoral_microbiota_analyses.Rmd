@@ -1,0 +1,483 @@
+---
+title: "Single cell intratumoral microbiota analyses"
+output: html_document
+---
+
+## Loading R packages
+```{r}
+library(Seurat)
+library(data.table)
+library(magrittr)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(scCustomize)
+library(Nebulosa)
+library(tibble)
+library(tools)
+library(purrr)
+library(SCP)
+library(BiocParallel)
+library(infercnv)
+library(patchwork)
+library(AnnoProbe)
+library(gridExtra)
+library(grid)
+require(dendextend)
+require(ggthemes)
+library(tidyverse)
+library(scales)
+library(ggpubr)
+register(MulticoreParam(workers = 8, progressbar = TRUE))
+```
+
+
+##Single cell sequencing data visualization
+### Uniform Manifold Approximation and Projection (UMAP)
+```{r}
+p <- CellDimPlot(sce,
+            group.by = "celltype",
+            reduction = "UMAP",
+            cells.highlight = TRUE,
+            pt.size = 0.1,
+            sizes.highlight = 0.1,
+            stroke.highlight = 0.2,
+            add_mark = FALSE,
+            theme_use = "theme_blank",
+            legend.position = "right")
+p
+```
+
+### Proportion of cell types
+```{r}
+df <- sce@meta.data
+
+df_summary <- df %>%
+  group_by(orig.ident, celltype) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(orig.ident) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+ncelltype <- nlevels(df$celltype)
+pal1 <- palette_scp(x = 1:ncelltype, n = ncelltype)
+names(pal1) <- levels(df$celltype)
+
+p <- ggplot(data = df_summary) +
+  geom_bar(mapping = aes(x = orig.ident, y = percentage, fill = celltype),
+           stat = "identity",
+           position = "stack",
+           color = "black",
+           linewidth = 0.08,
+           width = 0.8) +
+  scale_fill_manual(values = pal1) +
+  scale_y_continuous(expand = c(0, 0), labels = scales::percent_format(scale = 1)) +
+  labs(title = NULL, x = NULL, y = "Percentage", fill = "Cell Type") +
+  theme_test()
+p
+```
+
+### Percentage of cells detected microbes
+```{r}
+df <- sce@meta.data
+df$detection <- factor(df$detection, levels = c("not_detected", "detected"))
+
+df_summary <- df %>%
+  group_by(orig.ident, detection) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(orig.ident) %>%
+  mutate(percentage = count / sum(count) * 100) %>%
+  filter(detection == "detected")
+
+p <- ggplot(data = df) +
+  geom_bar(mapping = aes(x = orig.ident,
+                         fill = detection),
+           position = "fill",
+           width = 0.8) +
+  scale_fill_manual(values = c("detected" = "darkred",
+                               "not_detected" = "#DEDEDF"),
+                    labels = c("Detected",
+                               "Not detected")) +
+  scale_y_continuous(expand = c(0,0),
+                     labels = scales::percent) +
+  labs(title = NULL, x = NULL, y = "Percentage", fill = "Detection") +
+  theme_test() +
+  geom_text(data = df_summary %>% filter(detection == "detected"),
+            aes(x = orig.ident,
+                y = percentage/100,
+                label = paste0(round(percentage, 1), "%")),
+            nudge_y = 0.05,
+            color = "black",
+            size = 3.3)
+p
+```
+
+### Proportion of microbes
+```{r}
+df <- phylum_all %>% t() %>% as.data.frame()
+df <- df[rowSums(df)>0, colSums(df)>0]
+df <- df[-nrow(df), ]
+
+colsum <- colSums(df)
+colsum <- colsum[order(colsum, decreasing = TRUE)]
+topn <- head(names(colsum), 5)
+df_topn <- df[, topn]
+df_others <- rowSums(df[,!names(df) %in% topn])
+df_topn$Others <- df_others
+df_topn$sample_id <- rownames(df_topn) %>% str_sub(1, 4)
+
+result <- df_topn %>%
+  group_by(sample_id) %>% 
+  summarise(across(where(is.numeric), sum))
+result_long <- result %>%
+  pivot_longer(-1, names_to = "phylum", values_to = "count") %>%
+  group_by(sample_id) %>%
+  mutate(percentage = count / sum(count) * 100)
+result_long$phylum <- factor(result_long$phylum, levels = c(topn, "Others"))
+
+p <- ggplot(data = result_long) +
+  geom_bar(mapping = aes(x = sample_id, y = percentage, fill = phylum),
+           stat = "identity",
+           position = "stack",
+           color = "black",
+           linewidth = 0.08,
+           width = 0.8) +
+  scale_fill_manual(values = pal2) +
+  scale_y_continuous(expand = c(0, 0), labels = scales::percent_format(scale = 1)) +
+  labs(title = NULL, x = NULL, y = "Percentage", fill = "Phylum") +
+  theme_test()
+p
+```
+
+### Average microbe count
+```{r}
+avg_microbe_sorted <- avg_microbe %>%
+  arrange(desc(avg_microbe))
+avg_microbe_sorted$cell_type <- factor(avg_microbe_sorted$cell_type,
+                                       levels = as.character(avg_microbe_sorted$cell_type))
+
+p <- ggplot(avg_microbe_sorted) +
+  geom_bar(aes(x = cell_type, y = avg_microbe, fill = cell_type),
+           stat = "identity",
+           color = "black",
+           linewidth = 0.18,
+           width = 0.8) +
+  scale_fill_manual(values = pal1) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(title = NULL, 
+       x = NULL, 
+       y = "Average microbe count",
+       fill = "Celltype") +
+  theme_test()
+p
+```
+
+### Microbe Positive cells among cell types by samples
+```{r}
+# Left
+samples <- unique(sce$orig.ident)
+length(samples)
+
+plot_list <- lapply(seq_along(samples), function(i) {
+  sample <- samples[i]
+  sce_subset <- subset(sce, orig.ident == sample)
+  
+  p <- FeatureDimPlot(sce_subset,
+                      features = "microbe_count",
+                      palcolor = c("#ffdfd4", "red", "darkred", "grey20", "black"),
+                      reduction = "UMAP",
+                      cells.highlight = TRUE,
+                      pt.size = 0.2,
+                      sizes.highlight = 0.4,
+                      stroke.highlight = 0.2,
+                      theme_use = "theme_blank",
+                      legend.position = "right")
+  
+  return(p)
+})
+wrap_plots(plot_list, ncol = 2, nrow = 2, byrow = TRUE)
+
+# Right
+df <- sce@meta.data
+df$detection <- factor(df$detection, levels = c("not_detected", "detected"))
+df$cell_type <- factor(df$cell_type, levels = levels(df$cell_type))
+
+samples <- unique(sce$orig.ident)
+length(samples)
+
+plot_list <- lapply(seq_along(samples), function(i) {
+  sample <- samples[i]
+  
+  df_subset <- df %>%
+    filter(orig.ident == sample)
+  
+  df_summary_subset <- df_subset %>%
+    group_by(cell_type, detection) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    complete(cell_type, detection, fill = list(count = 0)) %>%
+    group_by(cell_type) %>%
+    mutate(percentage = count / sum(count) * 100)
+  
+  p <- ggplot(data = df_subset) +
+    geom_bar(mapping = aes(x = cell_type,
+                           fill = detection),
+             position = "fill",
+             width = 0.9) +
+    scale_fill_manual(values = c("detected" = "darkred",
+                                 "not_detected" = "#DEDEDF"),
+                      labels = c("detected" = "Detected",
+                                 "not_detected" = "Not detected")) +
+    scale_y_continuous(expand = c(0,0),
+                       labels = scales::percent) +
+    labs(title = NULL, x = NULL, y = "Percentage", fill = "Detection") +
+    theme_test() +
+    coord_flip() +
+    geom_text(data = df_summary_subset %>% filter(detection == "detected"),
+              aes(x = cell_type,
+                  y = percentage/100,
+                  label = paste0(round(percentage, 1), "%")),
+              nudge_y = 0.15,
+              color = "black",
+              size = 3.3)
+  
+  return(p)
+})
+wrap_plots(plot_list, ncol = 2, nrow = 2, byrow = TRUE)
+```
+
+
+##Single-cell copy-number variation
+```{r}
+sce=sce[,sce$celltype%in%c('OB','CB','T cell')]
+sce$celltype_new=ifelse(sce$celltype%in%c('OB'),'OB',
+                            ifelse(sce$celltype%in%c('CB'),'CB','Immune cell'))
+sce$celltype_new=factor(sce$celltype_new,levels=c('OB','CB','Immune cell'))
+
+Idents(sce)=sce$celltype_new
+
+dat=GetAssayData(sce,slot='counts',assay='RNA')
+groupinfo=data.frame(row.names=colnames(dat),v2= Idents(sce))
+geneInfor=annoGene(rownames(dat), "SYMBOL",'human')
+geneInfor=geneInfor[with(geneInfor,order(chr, start)),c(1,4:6)]  
+geneInfor=geneInfor[!duplicated(geneInfor[,1]),]
+length(unique(geneInfor[,1]))
+dat=dat[rownames(dat) %in% geneInfor[,1],]
+dat=dat[match( geneInfor[,1], rownames(dat) ),] 
+dim(dat)
+table(groupinfo$v2)
+rownames(geneInfor)=geneInfor[,1]
+geneInfor=geneInfor[,-1]
+
+infercnv_obj = CreateInfercnvObject(raw_counts_matrix=dat,
+                                    annotations_file=groupinfo,
+                                    delim="\t",
+                                    gene_order_file= geneInfor,
+                                    ref_group_names=c("Immune cell"))
+
+
+out_dir="infercnv_output"
+infercnv_obj2 = infercnv::run(infercnv_obj,
+                              cutoff=0.1, 
+                              out_dir= out_dir,
+                              cluster_by_groups=F,
+                              HMM_i3_use_KS = TRUE,
+                              analysis_mode = c("samples"),
+                              write_phylo = TRUE,
+                              write_expr_matrix = T,
+                              denoise = T,
+                              HMM = T
+)
+
+
+if( ! file.exists(paste0(infercnv_output,"cnv_scores.csv"))){
+  tmp=read.table(paste0(infercnv_output,"infercnv.references.txt"), header=T)
+  down=mean(rowMeans(tmp)) - 2 * mean( apply(tmp, 1, sd))
+  up=mean(rowMeans(tmp)) + 2 * mean( apply(tmp, 1, sd))
+  oneCopy=up-down
+  oneCopy
+  a1= down- 2*oneCopy
+  a2= down- 1*oneCopy
+  down;up
+  a3= up +  1*oneCopy
+  a4= up + 2*oneCopy 
+  
+  cnv_observations <- read.table(paste0(infercnv_output,"infercnv.observations.txt"), header=T)
+  cnv_table <- cbind(cnv_observations, tmp)
+  cnv_score_table <- as.matrix(cnv_table)
+  cnv_score_mat <- as.matrix(cnv_table)
+  cnv_score_table[cnv_score_mat > 0 & cnv_score_mat < a2] <- "A" 
+  cnv_score_table[cnv_score_mat >= a2 & cnv_score_mat < down] <- "B" 
+  cnv_score_table[cnv_score_mat >= down & cnv_score_mat <  up ] <- "C" 
+  cnv_score_table[cnv_score_mat >= up  & cnv_score_mat <= a3] <- "D" 
+  cnv_score_table[cnv_score_mat > a3  & cnv_score_mat <= a4 ] <- "E" 
+  cnv_score_table[cnv_score_mat > a4] <- "F"
+  table(cnv_score_table[,1])
+  cnv_score_table_pts <- cnv_table
+  rm(cnv_score_mat)
+  cnv_score_table_pts[cnv_score_table == "A"] <- 2
+  cnv_score_table_pts[cnv_score_table == "B"] <- 1
+  cnv_score_table_pts[cnv_score_table == "C"] <- 0
+  cnv_score_table_pts[cnv_score_table == "D"] <- 1
+  cnv_score_table_pts[cnv_score_table == "E"] <- 2
+  cnv_score_table_pts[cnv_score_table == "F"] <- 2
+  cell_scores_CNV <- as.data.frame(colSums(cnv_score_table_pts))
+  colnames(cell_scores_CNV) <- "cnv_score"
+  head(cell_scores_CNV)
+  write.csv(x = cell_scores_CNV, file = paste0(infercnv_output,"cnv_scores.csv"))
+}
+```
+
+
+## Differential gene expression and gene set enrichment analysis
+```{r}
+## Left
+sce_mono_tam <- sce[, sce$celltype %in% c("Monocyte", "TAM")]
+sce_mono_tam$detection <- factor(sce_mono_tam$detection, levels = c("detected", "not_detected"))
+DimPlot(sce_mono_tam, group.by = "celltype")
+
+DimPlot(sce_mono_tam, group.by = "detection")
+DimPlot(sce_mono_tam, group.by = "detection", split.by = "detection")
+
+p <- CellDimPlot(sce_mono_tam,
+            group.by = "detection",
+            split.by = "detection",
+            palcolor = c("darkred", "gray80"),
+            reduction = "UMAP",
+            cells.highlight = TRUE,
+            pt.size = 0.2,
+            sizes.highlight = 0.4,
+            theme_use = "theme_blank",
+            legend.position = "none")
+p
+
+## Middle
+deg_top_5 <- deg %>%
+  filter(!is.na(gene_name)) %>%
+  arrange(desc(log2FoldChange)) %>%
+  slice_head(n = 5) %>%
+  arrange(pvalue) %>%
+  mutate(gene_name = factor(gene_name, levels = gene_name))
+
+deg_btm_5 <- deg %>%
+  filter(!is.na(gene_name)) %>%
+  arrange(desc(log2FoldChange)) %>%
+  slice_tail(n = 5) %>%
+  arrange(pvalue) %>%
+  mutate(gene_name = factor(gene_name, levels = gene_name))
+
+deg %>%
+  ggplot() +
+  geom_hline(yintercept = 0) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray60") +
+  geom_hline(yintercept = -1, linetype = "dashed", color = "gray60")+
+  geom_vline(xintercept = -1500, linetype = "dashed") +
+  geom_point(aes(x = rank,
+                 y = log2FoldChange,
+                 color = pvalue,
+                 size = abs(log2FoldChange))) +
+  scale_x_continuous(breaks = c(-3000, -2000, -1000, 0),
+                     labels = c(0, 1000, 2000, 3000)) +
+  scale_y_continuous(breaks = c(-6, -4, -2, 0, 2),
+                     labels = c(-6, -4, -2, 0, 2),
+                     limits = c(-6.5, 2.5)) +
+  scale_color_gradient2(low = "darkred",
+                        high = "#80b1d3",
+                        mid = "#ffffff",
+                        midpoint = 0.05, 
+                        name = "P value") +
+  geom_text_repel(data = deg_top_5,
+                  aes(x = rank + 10,
+                      y = log2FoldChange,
+                      label = gene_name),
+                  box.padding = 0.5,
+                  nudge_x = 10,
+                  nudge_y = 0.2,
+                  segment.curvature = -0.1,
+                  segment.ncp = 3,
+                  segment.angle = 20,
+                  direction = "y",
+                  hjust = "left",
+                  size = 2.2,
+                  fontface = "italic") +
+  geom_text_repel(data = deg_btm_5,
+                  aes(x = rank + 10,
+                      y = log2FoldChange,
+                      label = gene_name),
+                  box.padding = 0.5,
+                  nudge_x = 10,
+                  nudge_y = -0.2,
+                  segment.curvature = -0.1,
+                  segment.ncp = 3,
+                  segment.angle = 20,
+                  direction = "y",
+                  hjust = "right",
+                  size = 2.4,
+                  fontface = "italic") +
+  scale_size(range = c(1, 4),
+             name = "Log2(fold change)") +
+  labs(x = "Rank of differentially expressed genes",
+       y = "Log2 fold change") +
+  guides(color = guide_colorbar(frame.colour = "black",
+                                frame.linewidth = 0.25,
+                                order = 1,
+                                label.theme = element_text(size = 7.2, color = "black", face = "plain"),
+                                title.theme = element_text(size = 8, color = "black", face = "plain"),
+                                barheight = 2.4,
+                                barwidth = 0.68,
+                                ticks.colour = "black"),
+         size = guide_legend(title = "Log2(fold change)", 
+                             title.theme = element_text(size = 8, color = "black", face = "plain"),
+                             label.theme = element_text(size = 7.2, color = "black"),
+                             keywidth = 0.7, keyheight = 0.7)) +
+  theme_test()
+p
+
+## Right
+color <- "#e87676"
+p <- ggplot(gsea_hal) +
+  geom_bar(aes(
+    x = -log10(pvalue),
+    y = interaction(Description, Regulation),
+    fill = Regulation
+  ), stat = "identity") +
+  scale_fill_manual(values = color, name = "Regulation") +
+  geom_text(
+    aes(
+      x = 0.03,
+      y = interaction(Description, Regulation),
+      label = Description
+    ),
+    size = 3.4,
+    hjust = 0,
+    vjust = -0.025,
+    color = "black"
+  ) +
+  geom_text(
+    aes(
+      x = 0.08,
+      y = interaction(Description, Regulation),
+      label = Gene
+    ),
+    size = 2,
+    hjust = 0,
+    vjust = 2.2,
+    color = "black"
+  ) +
+  geom_point(aes(
+    x = -min(setSize) / 80,
+    y = interaction(Description, Regulation),
+    size = setSize,
+    fill = Regulation
+  ),
+  shape = 21) +
+  geom_text(aes(
+    x = -min(setSize) / 80,
+    y = interaction(Description, Regulation),
+    label = setSize
+  ), size = 3) +
+  scale_size(range = c(4, 8), guide = guide_legend(override.aes = list(fill = "black"))) +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  labs(x = "-log10(P value)", y = "Description")
+p
+```
+
